@@ -59,7 +59,7 @@ async def query(
     while True:
         normalized = normalize_messages_for_api(conversation)
         api_messages = api_client.messages_to_api_format(normalized)
-        api_tools = api_client.tools_to_api_format(tools)
+        api_tools = await api_client.tools_to_api_format(tools)
         params = api_client.build_request_params(
             messages=api_messages,
             system=system,

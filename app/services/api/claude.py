@@ -187,14 +187,14 @@ class ClaudeAPIClient:
                     result.append({"role": role, "content": blocks})
         return result
 
-    def tools_to_api_format(self, tools: list) -> list[dict]:
+    async def tools_to_api_format(self, tools: list) -> list[dict]:
         """Convert Tool objects to API dict format."""
-        return [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.input_schema,
-            }
-            for tool in tools
-            if tool.is_enabled()
-        ]
+        result = []
+        for tool in tools:
+            if tool.is_enabled():
+                result.append({
+                    "name": tool.name,
+                    "description": await tool.prompt(),
+                    "input_schema": tool.input_schema,
+                })
+        return result

@@ -13,7 +13,7 @@ Python implementation of the Claude Code CLI — an AI coding assistant with str
 uv sync
 
 # Run the CLI
-uv run claude-code
+uv run ccoder
 
 # Run all tests
 uv run pytest

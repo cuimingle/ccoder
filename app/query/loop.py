@@ -182,7 +182,7 @@ class QueryRunner:
             # Normalize messages for API
             normalized = normalize_messages_for_api(messages_for_query)
             api_messages = self.params.api_client.messages_to_api_format(normalized)
-            api_tools = self.params.api_client.tools_to_api_format(self.params.tools)
+            api_tools = await self.params.api_client.tools_to_api_format(self.params.tools)
 
             # Determine max_tokens
             max_tokens = state.max_output_tokens_override or DEFAULT_MAX_TOKENS
