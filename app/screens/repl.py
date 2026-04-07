@@ -8,9 +8,12 @@ from textual.binding import Binding
 from textual.widgets import Footer, Header, Static
 from textual.worker import Worker
 
+from app.commands.bash_exec import execute_bash
+from app.components.command_suggestions import CommandSuggestions
 from app.components.messages import Messages
 from app.components.permission_prompt import PermissionPrompt
 from app.components.prompt_input import PromptInput
+from app.input_modes import InputMode, strip_mode_prefix
 from app.query import QueryResult
 from app.query_engine import QueryEngine
 from app.state.app_state import AppState
@@ -46,11 +49,14 @@ class ClaudeCodeApp(App):
         self._current_worker: Worker | None = None
         self._permission_event: asyncio.Event | None = None
         self._permission_result: PermissionResult | None = None
+        # Wire app_state reference into engine for command context
+        self.engine._app_state = state
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         yield Messages(id="messages")
         yield PermissionPrompt(id="permission")
+        yield CommandSuggestions(id="suggestions")
         yield Static(self._status_text(), id="status-bar")
         yield PromptInput(history=self.state.input_history, id="input")
         yield Footer()
@@ -72,12 +78,20 @@ class ClaudeCodeApp(App):
         prompt_input.disabled = True
 
         messages = self.query_one("#messages", Messages)
-        messages.append_user(text)
 
-        # Run query as a non-threaded worker (stays on event loop)
-        self._current_worker = self.run_worker(
-            self._run_query(text), thread=False, exclusive=True
-        )
+        if event.mode == InputMode.BASH:
+            # Direct shell execution — bypass Claude API
+            command = strip_mode_prefix(text, InputMode.BASH)
+            messages.append_user(f"!{command}")
+            self._current_worker = self.run_worker(
+                self._run_bash(command), thread=False, exclusive=True
+            )
+        else:
+            # Normal prompt or slash command
+            messages.append_user(text)
+            self._current_worker = self.run_worker(
+                self._run_query(text), thread=False, exclusive=True
+            )
 
     def on_prompt_input_cancel_requested(
         self, event: PromptInput.CancelRequested
@@ -90,6 +104,41 @@ class ClaudeCodeApp(App):
             messages.finalize_assistant()
             messages.append_system("Query cancelled.")
             self._enable_input()
+
+    def on_prompt_input_mode_changed(self, event: PromptInput.ModeChanged) -> None:
+        """Update status bar when input mode changes."""
+        self._update_status()
+
+    def on_prompt_input_command_input_changed(self, event: PromptInput.CommandInputChanged) -> None:
+        """Show/update command suggestions when user types a slash command prefix."""
+        suggestions = self.query_one("#suggestions", CommandSuggestions)
+        prompt_input = self.query_one("#input", PromptInput)
+        commands = self.engine.command_registry.list_commands()
+        prefix = event.prefix.lower()
+        matches = [
+            (cmd.name, cmd.description)
+            for cmd in commands
+            if cmd.name.startswith(prefix)
+        ]
+        suggestions.update_suggestions(matches)
+        prompt_input.suggesting = bool(matches)
+
+    def on_prompt_input_command_input_cleared(self, event: PromptInput.CommandInputCleared) -> None:
+        """Hide command suggestions."""
+        self.query_one("#suggestions", CommandSuggestions).hide()
+
+    def on_prompt_input_suggestion_navigate(self, event: PromptInput.SuggestionNavigate) -> None:
+        """Move selection in command suggestions."""
+        self.query_one("#suggestions", CommandSuggestions).move_selection(event.delta)
+
+    def on_prompt_input_suggestion_confirm(self, event: PromptInput.SuggestionConfirm) -> None:
+        """Confirm the selected command suggestion."""
+        suggestions = self.query_one("#suggestions", CommandSuggestions)
+        prompt_input = self.query_one("#input", PromptInput)
+        name = suggestions.confirm_selection()
+        if name:
+            prompt_input.value = f"/{name} "
+            prompt_input.suggesting = False
 
     def on_permission_prompt_resolved(
         self, event: PermissionPrompt.Resolved
@@ -112,6 +161,20 @@ class ClaudeCodeApp(App):
 
     # --- Internal methods ---
 
+    async def _run_bash(self, command: str) -> None:
+        """Execute a bash command directly and display the result."""
+        messages = self.query_one("#messages", Messages)
+        try:
+            result = await execute_bash(command, self.state.cwd)
+            messages.append_system(result.text)
+        except asyncio.CancelledError:
+            messages.append_system("Command cancelled.")
+        except Exception as e:
+            messages.append_system(f"Error: {e}")
+        finally:
+            self.state.is_busy = False
+            self._enable_input()
+
     async def _run_query(self, text: str) -> None:
         """Execute a query turn with streaming callbacks."""
         messages = self.query_one("#messages", Messages)
@@ -128,6 +191,13 @@ class ClaudeCodeApp(App):
             )
             messages.finalize_assistant()
 
+            # Handle command result displayed as system message (slash commands)
+            if result.response_text and not result.tool_calls:
+                # Only show as system message if it came from a slash command
+                from app.commands import is_command
+                if is_command(text):
+                    messages.append_system(result.response_text)
+
             # Show tool results from the query result
             for tc in result.tool_calls:
                 tool_result = tc.get("result")
@@ -140,6 +210,10 @@ class ClaudeCodeApp(App):
                     messages.append_tool_result(
                         tc["tool_name"], content, tool_result.is_error
                     )
+
+            # Handle exit request from commands like /exit
+            if getattr(result, "should_exit", False):
+                self.exit()
 
         except asyncio.CancelledError:
             messages.finalize_assistant()
@@ -182,7 +256,17 @@ class ClaudeCodeApp(App):
         model = self.state.model
         in_t = self.state.total_input_tokens
         out_t = self.state.total_output_tokens
-        return f" {model} | In: {in_t:,} Out: {out_t:,} | {self.state.cwd}"
+
+        # Show input mode indicator
+        mode_str = ""
+        try:
+            prompt_input = self.query_one("#input", PromptInput)
+            if prompt_input.input_mode == InputMode.BASH:
+                mode_str = " [BASH] |"
+        except Exception:
+            pass
+
+        return f" {model} |{mode_str} In: {in_t:,} Out: {out_t:,} | {self.state.cwd}"
 
     def _update_status(self) -> None:
         """Update the status bar."""
