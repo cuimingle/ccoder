@@ -20,3 +20,5 @@ class AppState:
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     turn_count: int = 0
+    session_name: str = ""
+    extra_dirs: list[str] = field(default_factory=list)

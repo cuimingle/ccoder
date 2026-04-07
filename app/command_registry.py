@@ -13,6 +13,7 @@ class CommandResult:
     handled: bool = True
     should_query: bool = False
     prompt_content: str = ""
+    should_exit: bool = False
 
 
 @dataclass

@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Callable
 
+from app.command_registry import CommandRegistry
 from app.commands import build_default_registry, parse_command
 from app.compaction import (
     compact_conversation,
@@ -55,6 +56,22 @@ class QueryEngine:
             self._permission_checker, self._hook_runner, permission_callback
         )
         self._command_registry = build_default_registry()
+        self._session_id: str = ""
+
+    @property
+    def command_registry(self) -> CommandRegistry:
+        """The command registry for slash commands."""
+        return self._command_registry
+
+    @property
+    def model(self) -> str:
+        """Current model name."""
+        return self._api_client.model
+
+    @model.setter
+    def model(self, value: str) -> None:
+        """Switch the active model."""
+        self._api_client.model = value
 
     async def run_turn(
         self,
@@ -83,9 +100,12 @@ class QueryEngine:
                 "total_output_tokens": self.total_output_tokens,
                 "turn_count": self.turn_count,
                 "cwd": self.cwd,
+                "app_state": getattr(self, "_app_state", None),
             }
             result = await self._command_registry.execute(command_name, args, context)
-            return QueryResult(response_text=result.text, tool_calls=[])
+            qr = QueryResult(response_text=result.text, tool_calls=[])
+            qr.should_exit = result.should_exit
+            return qr
 
         self.messages.append(UserMessage(content=user_input))
         system = build_system_prompt(cwd=self.cwd)

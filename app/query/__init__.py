@@ -28,6 +28,7 @@ class QueryResult:
     input_tokens: int = 0
     output_tokens: int = 0
     messages: list[Message] = field(default_factory=list)
+    should_exit: bool = False
 
 
 async def query(
