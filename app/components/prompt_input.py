@@ -1,25 +1,33 @@
-"""PromptInput widget — user input with history, keyboard shortcuts, and input modes."""
+"""PromptInput widget — multiline user input with history, keyboard shortcuts, and input modes."""
 from __future__ import annotations
 
 from textual.message import Message
-from textual.widgets import Input
+from textual.widgets import TextArea
+from textual.events import Key
 
 from app.input_modes import InputMode, detect_mode, strip_mode_prefix, prepend_mode_prefix
+from app.themes.claude_theme import CLAUDE_ORANGE
 
 _PLACEHOLDERS = {
-    InputMode.PROMPT: "Type a message...",
-    InputMode.BASH: "! Shell command...",
+    InputMode.PROMPT: "Type a message… (Enter to send, Shift+Enter for newline)",
+    InputMode.BASH: "! Shell command…",
 }
 
 
-class PromptInput(Input):
-    """Input widget with submit, history navigation, mode switching, and cancel support."""
+class PromptInput(TextArea):
+    """Multiline input widget with submit, history navigation, mode switching, and cancel support."""
 
     DEFAULT_CSS = """
     PromptInput {
         dock: bottom;
-        height: 3;
+        height: auto;
+        min-height: 3;
+        max-height: 12;
         border: tall $accent;
+        padding: 0 0;
+    }
+    PromptInput:focus {
+        border: tall #d77757;
     }
     """
 
@@ -65,7 +73,9 @@ class PromptInput(Input):
         pass
 
     def __init__(self, history: list[str] | None = None, **kwargs) -> None:
-        super().__init__(placeholder=_PLACEHOLDERS[InputMode.PROMPT], **kwargs)
+        # Remove 'placeholder' if passed — TextArea doesn't take it the same way
+        kwargs.pop("placeholder", None)
+        super().__init__(**kwargs)
         self._history: list[str] = history or []
         self._history_index: int = -1
         self._draft: str = ""
@@ -84,8 +94,20 @@ class PromptInput(Input):
     def suggesting(self, value: bool) -> None:
         self._suggesting = value
 
-    def _on_key(self, event) -> None:
-        """Handle special keys."""
+    @property
+    def value(self) -> str:
+        """Get the text content (compatibility with old Input API)."""
+        return self.text
+
+    @value.setter
+    def value(self, new_text: str) -> None:
+        """Set the text content (compatibility with old Input API)."""
+        self.clear()
+        self.insert(new_text)
+
+    def _on_key(self, event: Key) -> None:
+        """Handle special keys before default TextArea behavior."""
+        # Suggestion navigation takes priority
         if self._suggesting:
             if event.key == "up":
                 self.post_message(self.SuggestionNavigate(-1))
@@ -105,23 +127,38 @@ class PromptInput(Input):
                 event.prevent_default()
                 return
 
-        if event.key == "up":
+        # Enter = submit (without shift)
+        if event.key == "enter":
+            self._submit()
+            event.prevent_default()
+            return
+
+        # Shift+Enter = newline (handled by default TextArea, no override needed)
+
+        # History navigation (only when single-line or cursor at top/bottom)
+        if event.key == "up" and self._cursor_at_start():
             self._navigate_history(-1)
             event.prevent_default()
-        elif event.key == "down":
+            return
+        elif event.key == "down" and self._cursor_at_end():
             self._navigate_history(1)
             event.prevent_default()
-        elif event.key == "escape":
+            return
+
+        if event.key == "escape":
             self.post_message(self.CancelRequested())
             event.prevent_default()
-        elif event.key == "shift+tab":
+            return
+
+        if event.key == "shift+tab":
             self._cycle_mode()
             event.prevent_default()
+            return
 
-    def _on_input_changed(self, event: Input.Changed) -> None:
+    def _on_text_area_changed(self, event: TextArea.Changed) -> None:
         """Detect slash command prefix and emit suggestion events."""
-        value = event.value.strip()
-        if value.startswith("/") and " " not in value:
+        value = self.text.strip()
+        if value.startswith("/") and " " not in value and "\n" not in value:
             prefix = value[1:]
             self._suggesting = True
             self.post_message(self.CommandInputChanged(prefix))
@@ -129,37 +166,14 @@ class PromptInput(Input):
             self._suggesting = False
             self.post_message(self.CommandInputCleared())
 
-    def _cycle_mode(self) -> None:
-        """Cycle between PROMPT and BASH input modes."""
-        if self._input_mode == InputMode.PROMPT:
-            new_mode = InputMode.BASH
-            # Prepend ! to current text
-            current = self.value.strip()
-            if current and not current.startswith("!"):
-                self.value = f"!{current}"
-            elif not current:
-                self.value = "!"
-        else:
-            new_mode = InputMode.PROMPT
-            # Strip ! prefix from current text
-            current = self.value.strip()
-            if current.startswith("!"):
-                self.value = current[1:].strip()
-
-        self._input_mode = new_mode
-        self.placeholder = _PLACEHOLDERS[new_mode]
-        self.post_message(self.ModeChanged(new_mode))
-
-    def _on_input_submitted(self, event: Input.Submitted) -> None:
-        """Handle Enter key — intercept the base Input.Submitted."""
-        event.stop()
-
+    def _submit(self) -> None:
+        """Submit the current input text."""
         # Hide suggestions on submit
         if self._suggesting:
             self._suggesting = False
             self.post_message(self.CommandInputCleared())
 
-        text = self.value.strip()
+        text = self.text.strip()
         if not text:
             return
 
@@ -172,15 +186,32 @@ class PromptInput(Input):
         self._history_index = -1
         self._draft = ""
 
-        # Clear input and post our UserSubmitted message
-        self.value = ""
+        # Clear input
+        self.clear()
 
         # Reset mode to PROMPT after submission
         if self._input_mode != InputMode.PROMPT:
             self._input_mode = InputMode.PROMPT
-            self.placeholder = _PLACEHOLDERS[InputMode.PROMPT]
 
         self.post_message(self.UserSubmitted(text, mode))
+
+    def _cycle_mode(self) -> None:
+        """Cycle between PROMPT and BASH input modes."""
+        if self._input_mode == InputMode.PROMPT:
+            new_mode = InputMode.BASH
+            current = self.text.strip()
+            if current and not current.startswith("!"):
+                self.value = f"!{current}"
+            elif not current:
+                self.value = "!"
+        else:
+            new_mode = InputMode.PROMPT
+            current = self.text.strip()
+            if current.startswith("!"):
+                self.value = current[1:].strip()
+
+        self._input_mode = new_mode
+        self.post_message(self.ModeChanged(new_mode))
 
     def _navigate_history(self, direction: int) -> None:
         """Navigate input history with up/down arrows."""
@@ -188,7 +219,7 @@ class PromptInput(Input):
             return
 
         if self._history_index == -1:
-            self._draft = self.value
+            self._draft = self.text
 
         new_index = self._history_index + direction
 
@@ -205,3 +236,13 @@ class PromptInput(Input):
             idx = len(self._history) - 1 - new_index
             if 0 <= idx < len(self._history):
                 self.value = self._history[idx]
+
+    def _cursor_at_start(self) -> bool:
+        """Check if cursor is at the first line."""
+        row, _ = self.cursor_location
+        return row == 0
+
+    def _cursor_at_end(self) -> bool:
+        """Check if cursor is at the last line."""
+        row, _ = self.cursor_location
+        return row >= self.document.line_count - 1

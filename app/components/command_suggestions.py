@@ -6,6 +6,13 @@ from textual.reactive import reactive
 from textual.message import Message
 from rich.text import Text
 
+from app.themes.claude_theme import (
+    CLAUDE_ORANGE,
+    TEXT,
+    TEXT_MUTED,
+    SURFACE,
+)
+
 
 class CommandSuggestions(Widget):
     """Dropdown widget showing matching slash commands."""
@@ -16,10 +23,8 @@ class CommandSuggestions(Widget):
         height: auto;
         max-height: 12;
         display: none;
-        background: $surface;
-        border: tall $accent;
         padding: 0 1;
-        margin-bottom: 3;
+        margin-bottom: 0;
     }
     CommandSuggestions.visible {
         display: block;
@@ -77,11 +82,12 @@ class CommandSuggestions(Widget):
     def render(self) -> Text:
         lines = Text()
         for i, (name, desc) in enumerate(self._items):
-            prefix = " > " if i == self.selected_index else "   "
-            line = Text(f"{prefix}/{name}")
             if i == self.selected_index:
-                line.stylize("bold reverse")
-            line.append(f"  {desc}", style="dim")
+                line = Text(f" ❯ ", style=f"bold {CLAUDE_ORANGE}")
+                line.append(f"/{name}", style=f"bold {TEXT}")
+            else:
+                line = Text(f"   /{name}", style=f"{TEXT}")
+            line.append(f"  {desc}", style=f"{TEXT_MUTED}")
             if i < len(self._items) - 1:
                 line.append("\n")
             lines.append(line)
