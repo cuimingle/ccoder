@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 from textual.app import App, ComposeResult
 
-from app.components.messages import Messages
+from app.components.messages import Messages, _UserMessage, _AssistantMessage, _ToolCallRow, _SystemMessage
 from app.components.prompt_input import PromptInput
 from app.components.permission_prompt import PermissionPrompt
 from app.types.permissions import PermissionResult
@@ -36,8 +36,7 @@ class TestMessages:
             messages = pilot.app.query_one("#messages", Messages)
             messages.append_user("hello world")
             await pilot.pause()
-            # Check that a widget was mounted
-            children = messages.query(".user-message")
+            children = messages.query(_UserMessage)
             assert len(children) == 1
 
     @pytest.mark.asyncio
@@ -47,8 +46,7 @@ class TestMessages:
             messages.append_assistant_chunk("Hello")
             messages.append_assistant_chunk(" world")
             await pilot.pause()
-            # Should have one assistant widget with accumulated text
-            children = messages.query(".assistant-message")
+            children = messages.query(_AssistantMessage)
             assert len(children) == 1
             assert messages._assistant_buffer == "Hello world"
 
@@ -67,7 +65,7 @@ class TestMessages:
             messages = pilot.app.query_one("#messages", Messages)
             messages.append_tool_call("Bash", {"command": "ls"})
             await pilot.pause()
-            children = messages.query(".tool-call")
+            children = messages.query(_ToolCallRow)
             assert len(children) == 1
 
     @pytest.mark.asyncio
@@ -76,7 +74,7 @@ class TestMessages:
             messages = pilot.app.query_one("#messages", Messages)
             messages.append_system("Session compacted.")
             await pilot.pause()
-            children = messages.query(".system-message")
+            children = messages.query(_SystemMessage)
             assert len(children) == 1
 
     @pytest.mark.asyncio
@@ -108,6 +106,8 @@ class TestPromptInput:
         async with TrackApp().run_test() as pilot:
             input_widget = pilot.app.query_one("#input", PromptInput)
             input_widget.value = "test message"
+            await pilot.pause()
+            # Simulate enter key press — triggers _on_key -> _submit
             await pilot.press("enter")
             await pilot.pause()
             assert submitted_texts == ["test message"]
@@ -134,8 +134,11 @@ class TestPromptInput:
         async with PromptInputApp().run_test() as pilot:
             input_widget = pilot.app.query_one("#input", PromptInput)
             input_widget.value = "first"
+            await pilot.pause()
             await pilot.press("enter")
+            await pilot.pause()
             input_widget.value = "second"
+            await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
             assert input_widget._history == ["first", "second"]

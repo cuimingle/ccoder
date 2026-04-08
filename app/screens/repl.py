@@ -1,43 +1,130 @@
-"""ClaudeCodeApp — main Textual REPL application."""
+"""ClaudeCodeApp — main Textual REPL application with Claude Code TUI."""
 from __future__ import annotations
 
 import asyncio
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Footer, Header, Static
+from textual.widgets import Static, Markdown
 from textual.worker import Worker
 
 from app.commands.bash_exec import execute_bash
 from app.components.command_suggestions import CommandSuggestions
+from app.components.logo_header import LogoHeader
 from app.components.messages import Messages
 from app.components.permission_prompt import PermissionPrompt
 from app.components.prompt_input import PromptInput
+from app.components.spinner import Spinner
+from app.components.status_bar import StatusBar
 from app.input_modes import InputMode, strip_mode_prefix
 from app.query import QueryResult
 from app.query_engine import QueryEngine
 from app.state.app_state import AppState
+from app.themes.claude_theme import (
+    BACKGROUND,
+    SURFACE,
+    SURFACE_LIGHT,
+    CLAUDE_ORANGE,
+    TEXT,
+    TEXT_MUTED,
+    TEXT_SUBTLE,
+    BORDER_NORMAL,
+    BORDER_FOCUSED,
+)
 from app.types.permissions import PermissionResult
 
 
 class ClaudeCodeApp(App):
-    """Interactive REPL for Claude Code."""
+    """Interactive REPL for Claude Code — fullscreen TUI."""
 
     TITLE = "Claude Code"
 
-    CSS = """
-    #status-bar {
+    CSS = f"""
+    Screen {{
+        background: {BACKGROUND};
+    }}
+
+    /* ── Logo header ─────────────────────────────────── */
+    #logo {{
+        dock: top;
+        height: auto;
+        background: {BACKGROUND};
+    }}
+
+    /* ── Divider below header ────────────────────────── */
+    #header-divider {{
+        dock: top;
+        height: 1;
+        background: {SURFACE_LIGHT};
+        color: {TEXT_SUBTLE};
+        padding: 0 2;
+    }}
+
+    /* ── Messages area ───────────────────────────────── */
+    #messages {{
+        height: 1fr;
+        background: {BACKGROUND};
+        scrollbar-size: 1 1;
+    }}
+    #messages Markdown {{
+        margin: 0 0 1 0;
+        padding: 0 1;
+    }}
+
+    /* ── Spinner ──────────────────────────────────────── */
+    #spinner {{
+        dock: bottom;
+        background: {BACKGROUND};
+    }}
+
+    /* ── Permission prompt ────────────────────────────── */
+    #permission {{
+        dock: bottom;
+    }}
+
+    /* ── Command suggestions ──────────────────────────── */
+    #suggestions {{
+        dock: bottom;
+        background: {SURFACE};
+        border: tall {TEXT_SUBTLE};
+        padding: 0 1;
+        margin-bottom: 0;
+        max-height: 12;
+    }}
+
+    /* ── Status bar ───────────────────────────────────── */
+    #status-bar {{
         dock: bottom;
         height: 1;
-        background: $surface;
-        color: $text-muted;
+        background: {SURFACE};
+    }}
+
+    /* ── Input area ───────────────────────────────────── */
+    #input {{
+        dock: bottom;
+        min-height: 3;
+        max-height: 12;
+        border: tall {BORDER_NORMAL};
+        background: {SURFACE};
+        padding: 0 0;
+    }}
+    #input:focus {{
+        border: tall {BORDER_FOCUSED};
+    }}
+
+    /* ── Keybinding hints ─────────────────────────────── */
+    #hints {{
+        dock: bottom;
+        height: 1;
+        background: {SURFACE};
+        color: {TEXT_SUBTLE};
         padding: 0 1;
-    }
+    }}
     """
 
     BINDINGS = [
-        Binding("ctrl+d", "quit", "Quit", show=True),
-        Binding("ctrl+l", "clear_screen", "Clear", show=True),
+        Binding("ctrl+d", "quit", "Quit", show=False),
+        Binding("ctrl+l", "clear_screen", "Clear", show=False),
     ]
 
     def __init__(
@@ -53,19 +140,33 @@ class ClaudeCodeApp(App):
         self.engine._app_state = state
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=False)
+        yield LogoHeader(
+            version="0.1.0",
+            model=self.state.model,
+            cwd=self.state.cwd,
+            id="logo",
+        )
+        yield Static(
+            "─" * 80,
+            id="header-divider",
+        )
         yield Messages(id="messages")
+        yield Spinner(id="spinner")
         yield PermissionPrompt(id="permission")
         yield CommandSuggestions(id="suggestions")
-        yield Static(self._status_text(), id="status-bar")
+        yield StatusBar(id="status-bar")
         yield PromptInput(history=self.state.input_history, id="input")
-        yield Footer()
+        yield Static(
+            " Ctrl+D quit │ Ctrl+L clear │ Shift+Tab mode │ /help commands │ Esc cancel",
+            id="hints",
+        )
 
     def on_mount(self) -> None:
-        """Focus the input on start."""
+        """Focus the input on start and initialize status bar."""
         self.query_one("#input", PromptInput).focus()
+        self._update_status()
 
-    # --- Event handlers ---
+    # ── Event handlers ────────────────────────────────────────────────
 
     def on_prompt_input_user_submitted(self, event: PromptInput.UserSubmitted) -> None:
         """Handle user input submission."""
@@ -78,17 +179,18 @@ class ClaudeCodeApp(App):
         prompt_input.disabled = True
 
         messages = self.query_one("#messages", Messages)
+        spinner = self.query_one("#spinner", Spinner)
 
         if event.mode == InputMode.BASH:
-            # Direct shell execution — bypass Claude API
             command = strip_mode_prefix(text, InputMode.BASH)
             messages.append_user(f"!{command}")
+            spinner.show("Running command")
             self._current_worker = self.run_worker(
                 self._run_bash(command), thread=False, exclusive=True
             )
         else:
-            # Normal prompt or slash command
             messages.append_user(text)
+            spinner.show("Thinking")
             self._current_worker = self.run_worker(
                 self._run_query(text), thread=False, exclusive=True
             )
@@ -96,13 +198,14 @@ class ClaudeCodeApp(App):
     def on_prompt_input_cancel_requested(
         self, event: PromptInput.CancelRequested
     ) -> None:
-        """Handle Ctrl+C / Escape — cancel running query."""
+        """Handle Escape — cancel running query."""
         if self._current_worker and self._current_worker.is_running:
             self._current_worker.cancel()
             self.state.is_busy = False
             messages = self.query_one("#messages", Messages)
             messages.finalize_assistant()
             messages.append_system("Query cancelled.")
+            self.query_one("#spinner", Spinner).hide()
             self._enable_input()
 
     def on_prompt_input_mode_changed(self, event: PromptInput.ModeChanged) -> None:
@@ -148,7 +251,7 @@ class ClaudeCodeApp(App):
         if self._permission_event:
             self._permission_event.set()
 
-    # --- Actions ---
+    # ── Actions ───────────────────────────────────────────────────────
 
     def action_clear_screen(self) -> None:
         """Clear messages and reset session."""
@@ -159,11 +262,12 @@ class ClaudeCodeApp(App):
         self.state.total_output_tokens = 0
         self._update_status()
 
-    # --- Internal methods ---
+    # ── Internal methods ──────────────────────────────────────────────
 
     async def _run_bash(self, command: str) -> None:
         """Execute a bash command directly and display the result."""
         messages = self.query_one("#messages", Messages)
+        spinner = self.query_one("#spinner", Spinner)
         try:
             result = await execute_bash(command, self.state.cwd)
             messages.append_system(result.text)
@@ -173,16 +277,21 @@ class ClaudeCodeApp(App):
             messages.append_system(f"Error: {e}")
         finally:
             self.state.is_busy = False
+            spinner.hide()
             self._enable_input()
 
     async def _run_query(self, text: str) -> None:
         """Execute a query turn with streaming callbacks."""
         messages = self.query_one("#messages", Messages)
+        spinner = self.query_one("#spinner", Spinner)
 
         def on_text(chunk: str) -> None:
+            # Once we start getting text, switch spinner to indicate streaming
+            spinner.update_verb("Generating")
             messages.append_assistant_chunk(chunk)
 
         def on_tool_use(name: str, tool_input: dict) -> None:
+            spinner.update_verb(f"Running {name}")
             messages.append_tool_call(name, tool_input)
 
         try:
@@ -193,7 +302,6 @@ class ClaudeCodeApp(App):
 
             # Handle command result displayed as system message (slash commands)
             if result.response_text and not result.tool_calls:
-                # Only show as system message if it came from a slash command
                 from app.commands import is_command
                 if is_command(text):
                     messages.append_system(result.response_text)
@@ -226,6 +334,7 @@ class ClaudeCodeApp(App):
             self.state.turn_count = self.engine.turn_count
             self.state.total_input_tokens = self.engine.total_input_tokens
             self.state.total_output_tokens = self.engine.total_output_tokens
+            spinner.hide()
             self._update_status()
             self._enable_input()
 
@@ -251,23 +360,31 @@ class ClaudeCodeApp(App):
         prompt_input.disabled = False
         prompt_input.focus()
 
-    def _status_text(self) -> str:
-        """Build status bar text."""
-        model = self.state.model
-        in_t = self.state.total_input_tokens
-        out_t = self.state.total_output_tokens
-
-        # Show input mode indicator
-        mode_str = ""
+    def _update_status(self) -> None:
+        """Update the status bar with current state."""
+        input_mode = "prompt"
         try:
             prompt_input = self.query_one("#input", PromptInput)
             if prompt_input.input_mode == InputMode.BASH:
-                mode_str = " [BASH] |"
+                input_mode = "bash"
         except Exception:
             pass
 
-        return f" {model} |{mode_str} In: {in_t:,} Out: {out_t:,} | {self.state.cwd}"
+        # Calculate context percentage
+        context_pct = 0.0
+        total_tokens = self.state.total_input_tokens + self.state.total_output_tokens
+        if total_tokens > 0:
+            # Rough estimate: model context window
+            max_ctx = 200000  # default for Claude models
+            context_pct = min(100.0, (total_tokens / max_ctx) * 100)
 
-    def _update_status(self) -> None:
-        """Update the status bar."""
-        self.query_one("#status-bar", Static).update(self._status_text())
+        status_bar = self.query_one("#status-bar", StatusBar)
+        status_bar.update_state(
+            model=self.state.model,
+            permission_mode=self.state.permission_mode,
+            input_tokens=self.state.total_input_tokens,
+            output_tokens=self.state.total_output_tokens,
+            context_pct=context_pct,
+            cwd=self.state.cwd,
+            input_mode=input_mode,
+        )
