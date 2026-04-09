@@ -51,7 +51,8 @@ class ProductionDeps:
     async def call_model(
         self, params: APIRequestParams, abort_signal: AbortSignal | None = None
     ) -> AsyncIterator[StreamEvent]:
-        return self._api_client.stream_with_retry(params, abort_signal=abort_signal)
+        async for event in self._api_client.stream_with_retry(params, abort_signal=abort_signal):
+            yield event
 
     def microcompact(self, messages: list[Message]) -> list[Message]:
         return micro_compact_messages(messages)

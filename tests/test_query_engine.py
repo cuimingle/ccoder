@@ -56,7 +56,7 @@ async def test_engine_accumulates_tokens(engine):
 
 def test_engine_clear_resets_state(engine):
     engine.turn_count = 5
-    engine.total_input_tokens = 1000
+    engine._total_usage.input_tokens = 1000
     engine.clear()
     assert engine.turn_count == 0
     assert engine.messages == []
@@ -66,8 +66,8 @@ def test_engine_clear_resets_state(engine):
 @pytest.mark.asyncio
 async def test_engine_cost_command(engine):
     """Engine processes /cost and shows token info."""
-    engine.total_input_tokens = 5000
-    engine.total_output_tokens = 2000
+    engine._total_usage.input_tokens = 5000
+    engine._total_usage.output_tokens = 2000
     engine.turn_count = 3
 
     result = await engine.run_turn("/cost")

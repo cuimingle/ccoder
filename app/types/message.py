@@ -116,11 +116,38 @@ def accumulate_usage(total: MessageUsage, delta: MessageUsage) -> MessageUsage:
 
 @dataclass
 class SDKMessage:
-    """Unified message type yielded by QueryEngine.submit_message()."""
+    """Unified message type yielded by QueryEngine.submit_message().
+
+    Mirrors TypeScript ``SDKMessage`` — all yields from the engine carry
+    one of these so SDK / TUI consumers have a single type to switch on.
+    """
     type: str  # system_init, user, assistant, tool_result, stream_event,
     #             compact_boundary, tool_use_summary, result
+    subtype: str = ""  # for result: success | error_max_turns | error_max_budget_usd | error_during_execution
     message: Message | None = None
     event: Any = None  # StreamEvent, when type == "stream_event"
     init_data: dict[str, Any] | None = None  # for system_init
     result_data: dict[str, Any] | None = None  # for result
     usage: MessageUsage | None = None
+    session_id: str = ""
+    is_error: bool = False
+    # result fields
+    duration_ms: int = 0
+    num_turns: int = 0
+    result_text: str = ""
+    stop_reason: str | None = None
+    total_cost_usd: float = 0.0
+    errors: list[str] | None = None
+    permission_denials: list[dict[str, Any]] | None = None
+
+
+# ---------------------------------------------------------------------------
+# Permission denial record
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PermissionDenial:
+    """A record of a denied tool-use permission, for SDK reporting."""
+    tool_name: str
+    tool_use_id: str
+    tool_input: dict[str, Any] = field(default_factory=dict)

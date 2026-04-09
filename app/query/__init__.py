@@ -1,34 +1,98 @@
-"""Core API query function with streaming and tool call loop."""
-from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Callable, TYPE_CHECKING
+"""Core query function — async generator wrapping QueryRunner.
 
-from app.tool import Tool, ToolResult, ToolContext
+Matches TypeScript ``query.ts`` top-level ``query()`` function:
+an async generator that delegates to ``queryLoop()`` (here ``QueryRunner``),
+yielding ``StreamEvent | Message`` and returning a ``Terminal``.
+
+Also provides a convenience ``query()`` function that collects results into
+a ``QueryResult`` dataclass for callers that don't need streaming.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Callable, TYPE_CHECKING
+
+from app.abort import AbortController
+from app.query.deps import ProductionDeps
+from app.query.loop import QueryParams, QueryRunner
+from app.query.types import Terminal, TerminalReason
+from app.services.api.claude import StreamEvent
 from app.types.message import (
     AssistantMessage,
+    Message,
     TextBlock,
     ToolUseBlock,
-    ToolResultBlock,
     UserMessage,
-    Message,
 )
-from app.services.api.claude import ClaudeAPIClient, StreamEvent
-from app.compaction import reactive_compact
-from app.message_normalization import normalize_messages_for_api
-from app.streaming_tool_executor import StreamingToolExecutor
 
 if TYPE_CHECKING:
+    from app.hooks import HookRunner
+    from app.services.api.claude import ClaudeAPIClient
+    from app.tool import Tool, ToolContext
     from app.tool_executor import ToolExecutor
 
 
 @dataclass
 class QueryResult:
+    """Collected result of a complete query turn."""
     response_text: str
     tool_calls: list[dict]
     input_tokens: int = 0
     output_tokens: int = 0
     messages: list[Message] = field(default_factory=list)
     should_exit: bool = False
+    terminal: Terminal | None = None
+
+
+async def query_stream(
+    messages: list[Message],
+    system: str,
+    tools: list[Tool],
+    api_client: ClaudeAPIClient,
+    cwd: str,
+    permission_mode: str = "manual",
+    tool_executor: ToolExecutor | None = None,
+    tool_context: ToolContext | None = None,
+    abort_controller: AbortController | None = None,
+    fallback_model: str | None = None,
+    max_turns: int | None = None,
+    max_output_tokens_override: int | None = None,
+    hook_runner: HookRunner | None = None,
+    token_budget: int | None = None,
+) -> AsyncIterator[StreamEvent | Message]:
+    """Async generator that runs the core query loop.
+
+    Yields ``StreamEvent`` and ``Message`` objects as they are produced.
+    After iteration ends, the ``QueryRunner.terminal`` attribute holds
+    the exit reason.
+
+    This is the primary API for streaming consumers (TUI, SDK).
+    """
+    from app.tool import ToolContext as _TC
+
+    deps = ProductionDeps(api_client)
+    ctx = tool_context or _TC(cwd=cwd, permission_mode=permission_mode)
+
+    params = QueryParams(
+        messages=messages,
+        system=system,
+        tools=tools,
+        deps=deps,
+        api_client=api_client,
+        tool_executor=tool_executor,
+        tool_context=ctx,
+        abort_controller=abort_controller,
+        fallback_model=fallback_model,
+        max_turns=max_turns,
+        max_output_tokens_override=max_output_tokens_override,
+        hook_runner=hook_runner,
+        permission_mode=permission_mode,
+        token_budget=token_budget,
+    )
+
+    runner = QueryRunner(params)
+    async for event in runner.run():
+        yield event
 
 
 async def query(
@@ -40,140 +104,76 @@ async def query(
     permission_mode: str = "manual",
     on_text: Callable[[str], None] | None = None,
     on_tool_use: Callable[[str, dict], None] | None = None,
-    tool_executor: "ToolExecutor | None" = None,
+    tool_executor: ToolExecutor | None = None,
     max_continuations: int = 3,
+    token_budget: int | None = None,
 ) -> QueryResult:
+    """Convenience wrapper that collects streaming results into a QueryResult.
+
+    Delegates to ``QueryRunner`` internally. Provides callbacks for text
+    and tool-use events for callers that need simple push-style updates
+    (e.g., pipe mode).
     """
-    Send messages to Claude API and process the streaming response.
-    Handles multi-turn tool call loops automatically.
-    Returns when the model stops with a text-only response.
-    """
-    conversation: list[Message] = list(messages)
-    all_tool_calls: list[dict] = []
-    total_input_tokens = 0
-    total_output_tokens = 0
-    continuation_count = 0
-    all_response_parts: list[str] = []
-    has_attempted_reactive_compact = False
-    context = ToolContext(cwd=cwd, permission_mode=permission_mode)
+    from app.tool import ToolContext as _TC
 
-    while True:
-        normalized = normalize_messages_for_api(conversation)
-        api_messages = api_client.messages_to_api_format(normalized)
-        api_tools = await api_client.tools_to_api_format(tools)
-        params = api_client.build_request_params(
-            messages=api_messages,
-            system=system,
-            tools=api_tools,
-        )
+    deps = ProductionDeps(api_client)
+    ctx = _TC(cwd=cwd, permission_mode=permission_mode)
 
-        # Collect streaming events for this turn
-        text_parts: list[str] = []
-        tool_use_events: list[StreamEvent] = []
-        stop_reason = ""
-
-        try:
-            async for event in api_client.stream(params):
-                if event.type == "text_delta":
-                    text_parts.append(event.text)
-                    if on_text:
-                        on_text(event.text)
-                elif event.type == "tool_use":
-                    tool_use_events.append(event)
-                    if on_tool_use:
-                        on_tool_use(event.tool_name, event.tool_input)
-                elif event.type == "usage":
-                    total_input_tokens += event.input_tokens
-                    total_output_tokens += event.output_tokens
-                elif event.type == "message_stop":
-                    stop_reason = event.stop_reason
-                    break
-        except Exception as e:
-            if _is_prompt_too_long(e) and not has_attempted_reactive_compact:
-                has_attempted_reactive_compact = True
-                compacted, comp_in, comp_out = await reactive_compact(
-                    conversation, api_client, system
-                )
-                conversation = compacted
-                total_input_tokens += comp_in
-                total_output_tokens += comp_out
-                continue
-            raise
-
-        response_text = "".join(text_parts)
-
-        # Build assistant message for this turn
-        assistant_content: list = []
-        if response_text:
-            assistant_content.append(TextBlock(text=response_text))
-        for ev in tool_use_events:
-            assistant_content.append(
-                ToolUseBlock(id=ev.tool_use_id, name=ev.tool_name, input=ev.tool_input)
-            )
-
-        if assistant_content:
-            conversation.append(AssistantMessage(content=assistant_content))
-
-        # If no tool calls, check if we need to auto-continue
-        if not tool_use_events:
-            if (
-                stop_reason == "max_output_tokens"
-                and continuation_count < max_continuations
-            ):
-                all_response_parts.append(response_text)
-                conversation.append(
-                    UserMessage(
-                        content="Continue from where you left off. Do not repeat previous content."
-                    )
-                )
-                continuation_count += 1
-                continue
-            # Include current turn's text in accumulated parts
-            all_response_parts.append(response_text)
-            break
-
-        # Execute tool calls via StreamingToolExecutor
-        if tool_use_events:
-            executor = StreamingToolExecutor(
-                tools, context=context,
-            )
-            for ev in tool_use_events:
-                executor.add_tool(
-                    ToolUseBlock(id=ev.tool_use_id, name=ev.tool_name, input=ev.tool_input)
-                )
-
-            tool_result_blocks: list[ToolResultBlock] = []
-            idx = 0
-            async for result in executor.get_results():
-                ev = tool_use_events[idx]
-                all_tool_calls.append({
-                    "tool_name": ev.tool_name,
-                    "tool_use_id": ev.tool_use_id,
-                    "input": ev.tool_input,
-                    "result": result,
-                })
-                tool_result_blocks.append(
-                    ToolResultBlock(
-                        tool_use_id=ev.tool_use_id,
-                        content=result.content if isinstance(result.content, str) else str(result.content),
-                        is_error=result.is_error,
-                    )
-                )
-                idx += 1
-
-            conversation.append(UserMessage(content=tool_result_blocks))
-
-    return QueryResult(
-        response_text="".join(all_response_parts),
-        tool_calls=all_tool_calls,
-        input_tokens=total_input_tokens,
-        output_tokens=total_output_tokens,
-        messages=conversation,
+    params = QueryParams(
+        messages=messages,
+        system=system,
+        tools=tools,
+        deps=deps,
+        api_client=api_client,
+        tool_executor=tool_executor,
+        tool_context=ctx,
+        max_turns=max_continuations * 10,  # generous turn limit
+        permission_mode=permission_mode,
+        token_budget=token_budget,
     )
 
+    runner = QueryRunner(params)
+    all_tool_calls: list[dict] = []
+    response_parts: list[str] = []
+    result_messages: list[Message] = list(messages)
 
-def _is_prompt_too_long(error: Exception) -> bool:
-    """Check if an exception indicates a prompt_too_long error."""
-    error_str = str(error).lower()
-    return "prompt is too long" in error_str or "prompt_too_long" in error_str
+    async for event in runner.run():
+        if isinstance(event, StreamEvent):
+            if event.type == "text_delta" and on_text:
+                on_text(event.text)
+            elif event.type == "tool_use" and on_tool_use:
+                on_tool_use(event.tool_name, event.tool_input)
+            # Collect text
+            if event.type == "text_delta":
+                response_parts.append(event.text)
+        elif isinstance(event, AssistantMessage):
+            result_messages.append(event)
+            # Extract tool calls
+            for block in event.content:
+                if isinstance(block, ToolUseBlock):
+                    all_tool_calls.append({
+                        "tool_name": block.name,
+                        "tool_use_id": block.id,
+                        "input": block.input,
+                    })
+            # Collect text from assistant message
+            for block in event.content:
+                if isinstance(block, TextBlock):
+                    if not response_parts or response_parts[-1] != block.text:
+                        # Avoid double-counting text already captured via stream
+                        pass
+        elif isinstance(event, UserMessage):
+            result_messages.append(event)
 
+    terminal = runner.terminal
+    total_in = terminal.input_tokens if terminal else 0
+    total_out = terminal.output_tokens if terminal else 0
+
+    return QueryResult(
+        response_text="".join(response_parts),
+        tool_calls=all_tool_calls,
+        input_tokens=total_in,
+        output_tokens=total_out,
+        messages=result_messages,
+        terminal=terminal,
+    )
