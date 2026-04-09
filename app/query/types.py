@@ -2,6 +2,8 @@
 
 Defines Terminal (exit reasons), Continue (loop continuation reasons),
 QueryLoopState (mutable per-iteration state), and related constants.
+
+Matches TypeScript ``query.ts`` state types.
 """
 from __future__ import annotations
 
@@ -10,6 +12,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import asyncio
+
     from app.types.message import Message, ToolUseSummaryMessage
 
 
@@ -65,13 +69,18 @@ class Continue:
 
 @dataclass
 class QueryLoopState:
-    """Mutable state carried across query-loop iterations."""
+    """Mutable state carried across query-loop iterations.
+
+    Matches TypeScript ``State`` — the loop body destructures this at the
+    top of each iteration, and continue sites write the fields back.
+    """
     messages: list[Message]
-    turn_count: int = 0
+    turn_count: int = 1  # starts at 1, matching TS
     max_output_tokens_recovery_count: int = 0
     has_attempted_reactive_compact: bool = False
     max_output_tokens_override: int | None = None
-    pending_tool_use_summary: ToolUseSummaryMessage | None = None
+    pending_tool_use_summary: asyncio.Task[ToolUseSummaryMessage | None] | None = None
+    stop_hook_active: bool = False
     transition: Continue | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
@@ -83,9 +92,14 @@ class QueryLoopState:
 
 @dataclass
 class AutoCompactTracking:
-    """Tracks auto-compaction state across iterations."""
+    """Tracks auto-compaction state across iterations.
+
+    Matches TypeScript ``AutoCompactTrackingState``.
+    """
+    compacted: bool = False
+    turn_id: str = ""
+    turn_counter: int = 0
     consecutive_failures: int = 0
-    last_compacted_at_tokens: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +113,7 @@ CONTEXT_WINDOW = 200_000
 
 # Recovery message injected when max_output_tokens is hit
 MAX_OUTPUT_TOKENS_RECOVERY_MESSAGE = (
-    "Output token limit hit. Resume directly \u2014 no apology, no recap. "
+    "Output token limit hit. Resume directly \u2014 no apology, no recap of what you were doing. "
     "Pick up mid-thought if that is where the cut happened. "
     "Break remaining work into smaller pieces."
 )

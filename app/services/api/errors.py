@@ -55,17 +55,20 @@ class ClassifiedError:
 def classify_error(error: Exception) -> ClassifiedError:
     """Classify an exception into a structured API error type."""
 
-    # User abort
-    if isinstance(error, anthropic.APIUserAbortError):
-        return ClassifiedError(
-            type=APIErrorType.ABORTED,
-            original=error,
-            message="Request aborted",
-            is_retryable=False,
-        )
+    # User abort — check by class name since SDK versions vary
+    error_name = type(error).__name__
+    if error_name in ("APIUserAbortError", "UserAbortError") or "abort" in str(error).lower():
+        # Only match if it's an anthropic error or explicit abort
+        if isinstance(error, anthropic.AnthropicError) or error_name in ("APIUserAbortError", "UserAbortError"):
+            return ClassifiedError(
+                type=APIErrorType.ABORTED,
+                original=error,
+                message="Request aborted",
+                is_retryable=False,
+            )
 
     # Connection timeout
-    if isinstance(error, anthropic.APIConnectionTimeoutError):
+    if isinstance(error, anthropic.APITimeoutError):
         return ClassifiedError(
             type=APIErrorType.TIMEOUT,
             original=error,
@@ -86,11 +89,22 @@ def classify_error(error: Exception) -> ClassifiedError:
     if isinstance(error, anthropic.APIStatusError):
         return _classify_status_error(error)
 
+    # Generic exception — check string for known patterns
+    error_str = str(error)
+    if _is_prompt_too_long_body(error_str):
+        return ClassifiedError(
+            type=APIErrorType.PROMPT_TOO_LONG,
+            original=error,
+            message=PROMPT_TOO_LONG_MESSAGE,
+            is_retryable=False,
+            raw_api_message=error_str,
+        )
+
     # Generic fallback
     return ClassifiedError(
         type=APIErrorType.UNKNOWN,
         original=error,
-        message=str(error),
+        message=error_str,
         is_retryable=False,
     )
 

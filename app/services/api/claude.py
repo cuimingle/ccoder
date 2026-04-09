@@ -2,9 +2,11 @@
 from __future__ import annotations
 import os
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import AsyncIterator, TYPE_CHECKING
 import anthropic
 
+if TYPE_CHECKING:
+    from app.abort import AbortSignal
 
 DEFAULT_MODEL = "claude-opus-4-6"
 DEFAULT_MAX_TOKENS = 8096
@@ -186,6 +188,29 @@ class ClaudeAPIClient:
                 if blocks:
                     result.append({"role": role, "content": blocks})
         return result
+
+    async def stream_with_retry(
+        self,
+        params: APIRequestParams,
+        abort_signal: AbortSignal | None = None,
+        fallback_model: str | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        """Stream with automatic retry, backoff, and model fallback.
+
+        Wraps :meth:`stream` with :func:`app.services.api.retry.with_retry`.
+        """
+        from app.services.api.retry import RetryConfig, with_retry
+
+        config = RetryConfig(
+            model=params.model,
+            fallback_model=fallback_model,
+        )
+
+        def _make_stream() -> AsyncIterator[StreamEvent]:
+            return self.stream(params)
+
+        async for event in with_retry(_make_stream, config, abort_signal):
+            yield event
 
     async def tools_to_api_format(self, tools: list) -> list[dict]:
         """Convert Tool objects to API dict format."""
